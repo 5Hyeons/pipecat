@@ -149,12 +149,12 @@ class BaseInputTransport(FrameProcessor):
 
     async def _handle_vad(self, audio_frames: bytes, vad_state: VADState):
         new_vad_state = await self._vad_analyze(audio_frames)
+        frame = None
         if (
             new_vad_state != vad_state
             and new_vad_state != VADState.STARTING
             and new_vad_state != VADState.STOPPING
         ):
-            frame = None
             if new_vad_state == VADState.SPEAKING:
                 frame = UserStartedSpeakingFrame()
             elif new_vad_state == VADState.QUIET:
@@ -164,15 +164,17 @@ class BaseInputTransport(FrameProcessor):
                 await self._handle_interruptions(frame)
 
             vad_state = new_vad_state
-        return vad_state
+        return vad_state, frame
 
     async def _audio_task_handler(self):
         vad_state: VADState = VADState.QUIET
+        audio_passthrough = False
         while True:
             try:
                 frame: InputAudioRawFrame = await self._audio_in_queue.get()
 
-                audio_passthrough = True
+                # audio_passthrough = True
+                interrupt_frame = None
 
                 # If an audio filter is available, run it before VAD.
                 if self._params.audio_in_filter:
@@ -181,8 +183,12 @@ class BaseInputTransport(FrameProcessor):
                 # Check VAD and push event if necessary. We just care about
                 # changes from QUIET to SPEAKING and vice versa.
                 if self._params.vad_enabled:
-                    vad_state = await self._handle_vad(frame.audio, vad_state)
-                    audio_passthrough = self._params.vad_audio_passthrough
+                    vad_state, interrupt_frame = await self._handle_vad(frame.audio, vad_state)
+                    if isinstance(interrupt_frame, UserStartedSpeakingFrame):
+                        audio_passthrough = True
+                    elif isinstance(interrupt_frame, UserStoppedSpeakingFrame):
+                        audio_passthrough = False
+                    # audio_passthrough = self._params.vad_audio_passthrough
 
                 # Push audio downstream if passthrough.
                 if audio_passthrough:
