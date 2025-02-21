@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024, Daily
+# Copyright (c) 2024–2025, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -21,13 +21,15 @@ from pipecat.frames.frames import (
     Frame,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
+    FunctionCallResultProperties,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMMessagesFrame,
+    LLMTextFrame,
     LLMUpdateSettingsFrame,
     OpenAILLMContextAssistantTimestampFrame,
+    StartFrame,
     StartInterruptionFrame,
-    TextFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
@@ -46,7 +48,13 @@ from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContextFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.ai_services import ImageGenService, LLMService, TTSService
+from pipecat.services.ai_services import (
+    ImageGenService,
+    LLMService,
+    TTSService,
+)
+from pipecat.services.base_whisper import BaseWhisperSTTService, Transcription
+from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 
 try:
@@ -102,7 +110,7 @@ class BaseOpenAILLMService(LLMService):
         seed: Optional[int] = Field(default_factory=lambda: NOT_GIVEN, ge=0)
         temperature: Optional[float] = Field(default_factory=lambda: NOT_GIVEN, ge=0.0, le=2.0)
         # Note: top_k is currently not supported by the OpenAI client library,
-        # so top_k is ignore right now.
+        # so top_k is ignored right now.
         top_k: Optional[int] = Field(default=None, ge=0)
         top_p: Optional[float] = Field(default_factory=lambda: NOT_GIVEN, ge=0.0, le=1.0)
         max_tokens: Optional[int] = Field(default_factory=lambda: NOT_GIVEN, ge=1)
@@ -115,6 +123,8 @@ class BaseOpenAILLMService(LLMService):
         model: str,
         api_key=None,
         base_url=None,
+        organization=None,
+        project=None,
         params: InputParams = InputParams(),
         **kwargs,
     ):
@@ -130,12 +140,16 @@ class BaseOpenAILLMService(LLMService):
             "extra": params.extra if isinstance(params.extra, dict) else {},
         }
         self.set_model_name(model)
-        self._client = self.create_client(api_key=api_key, base_url=base_url, **kwargs)
+        self._client = self.create_client(
+            api_key=api_key, base_url=base_url, organization=organization, project=project, **kwargs
+        )
 
-    def create_client(self, api_key=None, base_url=None, **kwargs):
+    def create_client(self, api_key=None, base_url=None, organization=None, project=None, **kwargs):
         return AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
+            organization=organization,
+            project=project,
             http_client=DefaultAsyncHttpxClient(
                 limits=httpx.Limits(
                     max_keepalive_connections=100, max_connections=1000, keepalive_expiry=None
@@ -220,7 +234,7 @@ class BaseOpenAILLMService(LLMService):
                 )
                 await self.start_llm_usage_metrics(tokens)
 
-            if len(chunk.choices) == 0:
+            if chunk.choices is None or len(chunk.choices) == 0:
                 continue
 
             await self.stop_ttfb_metrics()
@@ -252,12 +266,11 @@ class BaseOpenAILLMService(LLMService):
                 if tool_call.function and tool_call.function.name:
                     function_name += tool_call.function.name
                     tool_call_id = tool_call.id
-                    await self.call_start_function(context, function_name)
                 if tool_call.function and tool_call.function.arguments:
                     # Keep iterating through the response to collect all the argument fragments
                     arguments += tool_call.function.arguments
             elif chunk.choices[0].delta.content:
-                await self.push_frame(TextFrame(chunk.choices[0].delta.content))
+                await self.push_frame(LLMTextFrame(chunk.choices[0].delta.content))
 
         # if we got a function name and arguments, check to see if it's a function with
         # a registered handler. If so, run the registered callback, save the result to
@@ -341,7 +354,7 @@ class OpenAILLMService(BaseOpenAILLMService):
     ) -> OpenAIContextAggregatorPair:
         user = OpenAIUserContextAggregator(context)
         assistant = OpenAIAssistantContextAggregator(
-            user, expect_stripped_words=assistant_expect_stripped_words
+            context, expect_stripped_words=assistant_expect_stripped_words
         )
         return OpenAIContextAggregatorPair(_user=user, _assistant=assistant)
 
@@ -383,6 +396,62 @@ class OpenAIImageGenService(ImageGenService):
             yield frame
 
 
+class OpenAISTTService(BaseWhisperSTTService):
+    """OpenAI Whisper speech-to-text service.
+
+    Uses OpenAI's Whisper API to convert audio to text. Requires an OpenAI API key
+    set via the api_key parameter or OPENAI_API_KEY environment variable.
+
+    Args:
+        model: Whisper model to use. Defaults to "whisper-1".
+        api_key: OpenAI API key. Defaults to None.
+        base_url: API base URL. Defaults to None.
+        language: Language of the audio input. Defaults to English.
+        prompt: Optional text to guide the model's style or continue a previous segment.
+        temperature: Optional sampling temperature between 0 and 1. Defaults to 0.0.
+        **kwargs: Additional arguments passed to BaseWhisperSTTService.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: str = "whisper-1",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        language: Optional[Language] = Language.EN,
+        prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            language=language,
+            prompt=prompt,
+            temperature=temperature,
+            **kwargs,
+        )
+
+    async def _transcribe(self, audio: bytes) -> Transcription:
+        assert self._language is not None  # Assigned in the BaseWhisperSTTService class
+
+        # Build kwargs dict with only set parameters
+        kwargs = {
+            "file": ("audio.wav", audio, "audio/wav"),
+            "model": self.model_name,
+            "language": self._language,
+        }
+
+        if self._prompt is not None:
+            kwargs["prompt"] = self._prompt
+
+        if self._temperature is not None:
+            kwargs["temperature"] = self._temperature
+
+        return await self._client.audio.transcriptions.create(**kwargs)
+
+
 class OpenAITTSService(TTSService):
     """OpenAI Text-to-Speech service that generates audio from text.
 
@@ -405,20 +474,24 @@ class OpenAITTSService(TTSService):
     The service returns PCM-encoded audio at the specified sample rate.
     """
 
+    OPENAI_SAMPLE_RATE = 24000  # OpenAI TTS always outputs at 24kHz
+
     def __init__(
         self,
         *,
-        api_key: str | None = None,
+        api_key: Optional[str] = None,
         voice: str = "alloy",
         model: Literal["tts-1", "tts-1-hd"] = "tts-1",
-        sample_rate: int = 24000,
+        sample_rate: Optional[int] = None,
         **kwargs,
     ):
+        if sample_rate and sample_rate != self.OPENAI_SAMPLE_RATE:
+            logger.warning(
+                f"OpenAI TTS only supports {self.OPENAI_SAMPLE_RATE}Hz sample rate. "
+                f"Current rate of {self.sample_rate}Hz may cause issues."
+            )
         super().__init__(sample_rate=sample_rate, **kwargs)
 
-        self._settings = {
-            "sample_rate": sample_rate,
-        }
         self.set_model_name(model)
         self.set_voice(voice)
 
@@ -430,6 +503,14 @@ class OpenAITTSService(TTSService):
     async def set_model(self, model: str):
         logger.info(f"Switching TTS model to: [{model}]")
         self.set_model_name(model)
+
+    async def start(self, frame: StartFrame):
+        await super().start(frame)
+        if self.sample_rate != self.OPENAI_SAMPLE_RATE:
+            logger.warning(
+                f"OpenAI TTS requires {self.OPENAI_SAMPLE_RATE}Hz sample rate. "
+                f"Current rate of {self.sample_rate}Hz may cause issues."
+            )
 
     async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
         logger.debug(f"Generating TTS: [{text}]")
@@ -458,7 +539,7 @@ class OpenAITTSService(TTSService):
                 async for chunk in r.iter_bytes(8192):
                     if len(chunk) > 0:
                         await self.stop_ttfb_metrics()
-                        frame = TTSAudioRawFrame(chunk, self._settings["sample_rate"], 1)
+                        frame = TTSAudioRawFrame(chunk, self.sample_rate, 1)
                         yield frame
                 yield TTSStoppedFrame()
         except BadRequestError as e:
@@ -473,8 +554,8 @@ class OpenAIImageMessageFrame(Frame):
 
 
 class OpenAIUserContextAggregator(LLMUserContextAggregator):
-    def __init__(self, context: OpenAILLMContext):
-        super().__init__(context=context)
+    def __init__(self, context: OpenAILLMContext, **kwargs):
+        super().__init__(context=context, **kwargs)
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
@@ -510,9 +591,8 @@ class OpenAIUserContextAggregator(LLMUserContextAggregator):
 
 
 class OpenAIAssistantContextAggregator(LLMAssistantContextAggregator):
-    def __init__(self, user_context_aggregator: OpenAIUserContextAggregator, **kwargs):
-        super().__init__(context=user_context_aggregator._context, **kwargs)
-        self._user_context_aggregator = user_context_aggregator
+    def __init__(self, context: OpenAILLMContext, **kwargs):
+        super().__init__(context=context, **kwargs)
         self._function_calls_in_progress = {}
         self._function_call_result = None
         self._pending_image_frame_message = None
@@ -532,7 +612,7 @@ class OpenAIAssistantContextAggregator(LLMAssistantContextAggregator):
                 del self._function_calls_in_progress[frame.tool_call_id]
                 self._function_call_result = frame
                 # TODO-CB: Kwin wants us to refactor this out of here but I REFUSE
-                await self._push_aggregation()
+                await self.push_aggregation()
             else:
                 logger.warning(
                     "FunctionCallResultFrame tool_call_id does not match any function call in progress"
@@ -540,22 +620,27 @@ class OpenAIAssistantContextAggregator(LLMAssistantContextAggregator):
                 self._function_call_result = None
         elif isinstance(frame, OpenAIImageMessageFrame):
             self._pending_image_frame_message = frame
-            await self._push_aggregation()
+            await self.push_aggregation()
 
-    async def _push_aggregation(self):
+    async def push_aggregation(self):
         if not (
             self._aggregation or self._function_call_result or self._pending_image_frame_message
         ):
             return
 
         run_llm = False
+        properties: Optional[FunctionCallResultProperties] = None
 
-        aggregation = self._aggregation
-        self._reset()
+        aggregation = self._aggregation.strip()
+        self.reset()
 
         try:
+            if aggregation:
+                self._context.add_message({"role": "assistant", "content": aggregation})
+
             if self._function_call_result:
                 frame = self._function_call_result
+                properties = frame.properties
                 self._function_call_result = None
                 if frame.result:
                     self._context.add_message(
@@ -580,10 +665,12 @@ class OpenAIAssistantContextAggregator(LLMAssistantContextAggregator):
                             "tool_call_id": frame.tool_call_id,
                         }
                     )
-                    # Only run the LLM if there are no more function calls in progress.
-                    run_llm = not bool(self._function_calls_in_progress)
-            else:
-                self._context.add_message({"role": "assistant", "content": aggregation})
+                    if properties and properties.run_llm is not None:
+                        # If the tool call result has a run_llm property, use it
+                        run_llm = properties.run_llm
+                    else:
+                        # Default behavior is to run the LLM if there are no function calls in progress
+                        run_llm = not bool(self._function_calls_in_progress)
 
             if self._pending_image_frame_message:
                 frame = self._pending_image_frame_message
@@ -597,11 +684,14 @@ class OpenAIAssistantContextAggregator(LLMAssistantContextAggregator):
                 run_llm = True
 
             if run_llm:
-                await self._user_context_aggregator.push_context_frame()
+                await self.push_context_frame(FrameDirection.UPSTREAM)
+
+            # Emit the on_context_updated callback once the function call result is added to the context
+            if properties and properties.on_context_updated is not None:
+                await properties.on_context_updated()
 
             # Push context frame
-            frame = OpenAILLMContextFrame(self._context)
-            await self.push_frame(frame)
+            await self.push_context_frame()
 
             # Push timestamp frame with current time
             timestamp_frame = OpenAILLMContextAssistantTimestampFrame(timestamp=time_now_iso8601())

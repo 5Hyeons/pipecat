@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024, Daily
+# Copyright (c) 2024–2025, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -10,30 +10,28 @@ from langchain.prompts import ChatPromptTemplate
 from langchain_core.language_models import FakeStreamingListLLM
 
 from pipecat.frames.frames import (
-    EndFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    LLMMessagesFrame,
     TextFrame,
     TranscriptionFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_response import (
     LLMAssistantResponseAggregator,
     LLMUserResponseAggregator,
 )
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.processors.frameworks.langchain import LangchainProcessor
+from pipecat.tests.utils import SleepFrame, run_test
 
 
 class TestLangchain(unittest.IsolatedAsyncioTestCase):
     class MockProcessor(FrameProcessor):
         def __init__(self, name):
-            super().__init__()
-            self.name = name
+            super().__init__(name=name)
             self.token: list[str] = []
             # Start collecting tokens when we see the start frame
             self.start_collecting = False
@@ -65,35 +63,26 @@ class TestLangchain(unittest.IsolatedAsyncioTestCase):
         self.mock_proc = self.MockProcessor("token_collector")
 
         tma_in = LLMUserResponseAggregator(messages)
-        tma_out = LLMAssistantResponseAggregator(messages)
+        tma_out = LLMAssistantResponseAggregator(messages, expect_stripped_words=False)
 
-        pipeline = Pipeline(
-            [
-                tma_in,
-                proc,
-                self.mock_proc,
-                tma_out,
-            ]
+        pipeline = Pipeline([tma_in, proc, self.mock_proc, tma_out])
+
+        frames_to_send = [
+            UserStartedSpeakingFrame(),
+            TranscriptionFrame(text="Hi World", user_id="user", timestamp="now"),
+            SleepFrame(),
+            UserStoppedSpeakingFrame(),
+        ]
+        expected_down_frames = [
+            UserStartedSpeakingFrame,
+            UserStoppedSpeakingFrame,
+            LLMMessagesFrame,
+        ]
+        await run_test(
+            pipeline,
+            frames_to_send=frames_to_send,
+            expected_down_frames=expected_down_frames,
         )
 
-        task = PipelineTask(pipeline, PipelineParams(allow_interruptions=False))
-        await task.queue_frames(
-            [
-                UserStartedSpeakingFrame(),
-                TranscriptionFrame(text="Hi World", user_id="user", timestamp="now"),
-                UserStoppedSpeakingFrame(),
-                EndFrame(),
-            ]
-        )
-
-        runner = PipelineRunner()
-        await runner.run(task)
         self.assertEqual("".join(self.mock_proc.token), self.expected_response)
-        # TODO: Address this issue
-        # This next one would fail with:
-        # AssertionError: ' H e l l o   d e a r   h u m a n' != 'Hello dear human'
-        # self.assertEqual(tma_out.messages[-1]["content"], self.expected_response)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertEqual(tma_out.messages[-1]["content"], self.expected_response)

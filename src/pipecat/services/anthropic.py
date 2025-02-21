@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024, Daily
+# Copyright (c) 2024–2025, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -21,14 +21,15 @@ from pipecat.frames.frames import (
     Frame,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
+    FunctionCallResultProperties,
     LLMEnablePromptCachingFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMMessagesFrame,
+    LLMTextFrame,
     LLMUpdateSettingsFrame,
     OpenAILLMContextAssistantTimestampFrame,
     StartInterruptionFrame,
-    TextFrame,
     UserImageRawFrame,
     UserImageRequestFrame,
     VisionImageRawFrame,
@@ -125,9 +126,11 @@ class AnthropicLLMService(LLMService):
     def create_context_aggregator(
         context: OpenAILLMContext, *, assistant_expect_stripped_words: bool = True
     ) -> AnthropicContextAggregatorPair:
+        if isinstance(context, OpenAILLMContext):
+            context = AnthropicLLMContext.from_openai_context(context)
         user = AnthropicUserContextAggregator(context)
         assistant = AnthropicAssistantContextAggregator(
-            user, expect_stripped_words=assistant_expect_stripped_words
+            context, expect_stripped_words=assistant_expect_stripped_words
         )
         return AnthropicContextAggregatorPair(_user=user, _assistant=assistant)
 
@@ -190,7 +193,7 @@ class AnthropicLLMService(LLMService):
 
                 if event.type == "content_block_delta":
                     if hasattr(event.delta, "text"):
-                        await self.push_frame(TextFrame(event.delta.text))
+                        await self.push_frame(LLMTextFrame(event.delta.text))
                         completion_tokens_estimate += self._estimate_tokens(event.delta.text)
                     elif hasattr(event.delta, "partial_json") and tool_use_block:
                         json_accumulator += event.delta.partial_json
@@ -325,9 +328,9 @@ class AnthropicLLMService(LLMService):
 class AnthropicLLMContext(OpenAILLMContext):
     def __init__(
         self,
-        messages: list[dict] | None = None,
-        tools: list[dict] | None = None,
-        tool_choice: dict | None = None,
+        messages: Optional[List[dict]] = None,
+        tools: Optional[List[dict]] = None,
+        tool_choice: Optional[dict] = None,
         *,
         system: Union[str, NotGiven] = NOT_GIVEN,
     ):
@@ -650,11 +653,8 @@ class AnthropicLLMContext(OpenAILLMContext):
 
 
 class AnthropicUserContextAggregator(LLMUserContextAggregator):
-    def __init__(self, context: OpenAILLMContext | AnthropicLLMContext):
-        super().__init__(context=context)
-
-        if isinstance(context, OpenAILLMContext):
-            self._context = AnthropicLLMContext.from_openai_context(context)
+    def __init__(self, context: OpenAILLMContext | AnthropicLLMContext, **kwargs):
+        super().__init__(context=context, **kwargs)
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
@@ -702,9 +702,8 @@ class AnthropicUserContextAggregator(LLMUserContextAggregator):
 
 
 class AnthropicAssistantContextAggregator(LLMAssistantContextAggregator):
-    def __init__(self, user_context_aggregator: AnthropicUserContextAggregator, **kwargs):
-        super().__init__(context=user_context_aggregator._context, **kwargs)
-        self._user_context_aggregator = user_context_aggregator
+    def __init__(self, context: OpenAILLMContext | AnthropicLLMContext, **kwargs):
+        super().__init__(context=context, **kwargs)
         self._function_call_in_progress = None
         self._function_call_result = None
         self._pending_image_frame_message = None
@@ -724,7 +723,7 @@ class AnthropicAssistantContextAggregator(LLMAssistantContextAggregator):
             ):
                 self._function_call_in_progress = None
                 self._function_call_result = frame
-                await self._push_aggregation()
+                await self.push_aggregation()
             else:
                 logger.warning(
                     "FunctionCallResultFrame tool_call_id != InProgressFrame tool_call_id"
@@ -733,27 +732,30 @@ class AnthropicAssistantContextAggregator(LLMAssistantContextAggregator):
                 self._function_call_result = None
         elif isinstance(frame, AnthropicImageMessageFrame):
             self._pending_image_frame_message = frame
-            await self._push_aggregation()
+            await self.push_aggregation()
 
-    async def _push_aggregation(self):
+    async def push_aggregation(self):
         if not (
             self._aggregation or self._function_call_result or self._pending_image_frame_message
         ):
             return
 
         run_llm = False
+        properties: Optional[FunctionCallResultProperties] = None
 
-        aggregation = self._aggregation
-        self._reset()
+        aggregation = self._aggregation.strip()
+        self.reset()
 
         try:
+            if aggregation:
+                self._context.add_message({"role": "assistant", "content": aggregation})
+
             if self._function_call_result:
                 frame = self._function_call_result
+                properties = frame.properties
                 self._function_call_result = None
                 if frame.result:
                     assistant_message = {"role": "assistant", "content": []}
-                    if aggregation:
-                        assistant_message["content"].append({"type": "text", "text": aggregation})
                     assistant_message["content"].append(
                         {
                             "type": "tool_use",
@@ -775,9 +777,12 @@ class AnthropicAssistantContextAggregator(LLMAssistantContextAggregator):
                             ],
                         }
                     )
-                    run_llm = True
-            elif aggregation:
-                self._context.add_message({"role": "assistant", "content": aggregation})
+                    if properties and properties.run_llm is not None:
+                        # If the tool call result has a run_llm property, use it
+                        run_llm = properties.run_llm
+                    else:
+                        # Default behavior
+                        run_llm = True
 
             if self._pending_image_frame_message:
                 frame = self._pending_image_frame_message
@@ -791,11 +796,14 @@ class AnthropicAssistantContextAggregator(LLMAssistantContextAggregator):
                 run_llm = True
 
             if run_llm:
-                await self._user_context_aggregator.push_context_frame()
+                await self.push_context_frame(FrameDirection.UPSTREAM)
+
+            # Emit the on_context_updated callback once the function call result is added to the context
+            if properties and properties.on_context_updated is not None:
+                await properties.on_context_updated()
 
             # Push context frame
-            frame = OpenAILLMContextFrame(self._context)
-            await self.push_frame(frame)
+            await self.push_context_frame()
 
             # Push timestamp frame with current time
             timestamp_frame = OpenAILLMContextAssistantTimestampFrame(timestamp=time_now_iso8601())

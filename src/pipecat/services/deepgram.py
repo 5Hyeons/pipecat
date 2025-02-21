@@ -1,11 +1,11 @@
 #
-# Copyright (c) 2024, Daily
+# Copyright (c) 2024–2025, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
 import asyncio
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Dict, Optional
 
 from loguru import logger
 
@@ -20,7 +20,10 @@ from pipecat.frames.frames import (
     TTSAudioRawFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
 )
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.ai_services import STTService, TTSService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
@@ -31,6 +34,7 @@ try:
         AsyncListenWebSocketClient,
         DeepgramClient,
         DeepgramClientOptions,
+        ErrorResponse,
         LiveOptions,
         LiveResultResponse,
         LiveTranscriptionEvents,
@@ -50,14 +54,13 @@ class DeepgramTTSService(TTSService):
         *,
         api_key: str,
         voice: str = "aura-helios-en",
-        sample_rate: int = 24000,
+        sample_rate: Optional[int] = None,
         encoding: str = "linear16",
         **kwargs,
     ):
         super().__init__(sample_rate=sample_rate, **kwargs)
 
         self._settings = {
-            "sample_rate": sample_rate,
             "encoding": encoding,
         }
         self.set_voice(voice)
@@ -72,7 +75,7 @@ class DeepgramTTSService(TTSService):
         options = SpeakOptions(
             model=self._voice_id,
             encoding=self._settings["encoding"],
-            sample_rate=self._settings["sample_rate"],
+            sample_rate=self.sample_rate,
             container="none",
         )
 
@@ -100,9 +103,7 @@ class DeepgramTTSService(TTSService):
                 chunk = audio_buffer.read(chunk_size)
                 if not chunk:
                     break
-                frame = TTSAudioRawFrame(
-                    audio=chunk, sample_rate=self._settings["sample_rate"], num_channels=1
-                )
+                frame = TTSAudioRawFrame(audio=chunk, sample_rate=self.sample_rate, num_channels=1)
                 yield frame
 
                 yield TTSStoppedFrame()
@@ -118,15 +119,17 @@ class DeepgramSTTService(STTService):
         *,
         api_key: str,
         url: str = "",
-        live_options: LiveOptions = None,
+        sample_rate: Optional[int] = None,
+        live_options: Optional[LiveOptions] = None,
+        addons: Optional[Dict] = None,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        super().__init__(sample_rate=sample_rate, **kwargs)
+
         default_options = LiveOptions(
             encoding="linear16",
             language=Language.EN,
-            model="nova-2-general",
-            sample_rate=16000,
+            model="nova-3-general",
             channels=1,
             interim_results=True,
             smart_format=True,
@@ -146,6 +149,7 @@ class DeepgramSTTService(STTService):
             merged_options.language = merged_options.language.value
 
         self._settings = merged_options.to_dict()
+        self._addons = addons
 
         self._client = DeepgramClient(
             api_key,
@@ -154,20 +158,17 @@ class DeepgramSTTService(STTService):
                 options={"keepalive": "true"},  # verbose=logging.DEBUG
             ),
         )
-        self._connection: AsyncListenWebSocketClient = self._client.listen.asyncwebsocket.v("1")
-        self._connection.on(LiveTranscriptionEvents.Transcript, self._on_message)
+
         if self.vad_enabled:
             self._register_event_handler("on_speech_started")
             self._register_event_handler("on_utterance_end")
-            self._connection.on(LiveTranscriptionEvents.SpeechStarted, self._on_speech_started)
-            self._connection.on(LiveTranscriptionEvents.UtteranceEnd, self._on_utterance_end)
 
     @property
     def vad_enabled(self):
         return self._settings["vad_events"]
 
     def can_generate_metrics(self) -> bool:
-        return self.vad_enabled
+        return True
 
     async def set_model(self, model: str):
         await super().set_model(model)
@@ -184,6 +185,7 @@ class DeepgramSTTService(STTService):
 
     async def start(self, frame: StartFrame):
         await super().start(frame)
+        self._settings["sample_rate"] = self.sample_rate
         await self._connect()
 
     async def stop(self, frame: EndFrame):
@@ -200,7 +202,25 @@ class DeepgramSTTService(STTService):
 
     async def _connect(self):
         logger.debug("Connecting to Deepgram")
-        if not await self._connection.start(self._settings):
+
+        self._connection: AsyncListenWebSocketClient = self._client.listen.asyncwebsocket.v("1")
+
+        self._connection.on(
+            LiveTranscriptionEvents(LiveTranscriptionEvents.Transcript), self._on_message
+        )
+        self._connection.on(LiveTranscriptionEvents(LiveTranscriptionEvents.Error), self._on_error)
+
+        if self.vad_enabled:
+            self._connection.on(
+                LiveTranscriptionEvents(LiveTranscriptionEvents.SpeechStarted),
+                self._on_speech_started,
+            )
+            self._connection.on(
+                LiveTranscriptionEvents(LiveTranscriptionEvents.UtteranceEnd),
+                self._on_utterance_end,
+            )
+
+        if not await self._connection.start(options=self._settings, addons=self._addons):
             logger.error(f"{self}: unable to connect to Deepgram")
 
     async def _disconnect(self):
@@ -208,9 +228,21 @@ class DeepgramSTTService(STTService):
             logger.debug("Disconnecting from Deepgram")
             await self._connection.finish()
 
-    async def _on_speech_started(self, *args, **kwargs):
+    async def start_metrics(self):
         await self.start_ttfb_metrics()
         await self.start_processing_metrics()
+
+    async def _on_error(self, *args, **kwargs):
+        error: ErrorResponse = kwargs["error"]
+        logger.warning(f"{self} connection error, will retry: {error}")
+        await self.stop_all_metrics()
+        # NOTE(aleix): we don't disconnect (i.e. call finish on the connection)
+        # because this triggers more errors internally in the Deepgram SDK. So,
+        # we just forget about the previous connection and create a new one.
+        await self._connect()
+
+    async def _on_speech_started(self, *args, **kwargs):
+        await self.start_metrics()
         await self._call_event_handler("on_speech_started", *args, **kwargs)
 
     async def _on_utterance_end(self, *args, **kwargs):
@@ -237,3 +269,14 @@ class DeepgramSTTService(STTService):
                 await self.push_frame(
                     InterimTranscriptionFrame(transcript, "", time_now_iso8601(), language)
                 )
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, UserStartedSpeakingFrame) and not self.vad_enabled:
+            # Start metrics if Deepgram VAD is disabled & pipeline VAD has detected speech
+            await self.start_metrics()
+        elif isinstance(frame, UserStoppedSpeakingFrame):
+            # https://developers.deepgram.com/docs/finalize
+            await self._connection.finalize()
+            logger.trace(f"Triggered finalize event on: {frame.name=}, {direction=}")
